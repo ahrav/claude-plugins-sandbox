@@ -1,0 +1,55 @@
+[package]
+name = "talon"
+version = "0.1.0"
+edition = "2024"
+description = "Observability tap and agent for Claude Code hooks - captures events and forwards to trace collectors"
+license = "MIT OR Apache-2.0"
+
+# Define multiple binaries
+[[bin]]
+name = "talon-tap"
+path = "src/bin/talon-tap.rs"
+
+[[bin]]
+name = "talon-agent"
+path = "src/bin/talon-agent/main.rs"
+
+[dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1.0"
+
+# CLI parsing (for agent)
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Concurrency (for agent)
+crossbeam-channel = "0.5"
+
+# Compression (for agent)
+flate2 = "1.0"
+
+# HTTP client (for agent)
+reqwest = { version = "0.12", features = ["blocking", "gzip"] }
+
+# UUID generation (for agent)
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# Random jitter (for agent)
+rand = "0.9"
+
+# Directory resolution (for agent)
+dirs = "6.0"
+
+# System info (for tap)
+whoami = "1.6"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

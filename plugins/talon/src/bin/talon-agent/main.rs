@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crossbeam_channel as chan;
 use flate2::{Compression, write::GzEncoder};
+use fs2::FileExt;
 use serde_json::Value as Json;
 use std::{
     fs::{self, File, OpenOptions},
@@ -388,33 +389,69 @@ fn default_spool_dir() -> Result<PathBuf> {
 ///
 /// When file exceeds `cap_bytes`, keeps last 50% of lines (drops oldest) to bound
 /// disk usage while preserving recent events.
+///
+/// Uses exclusive file locking to prevent concurrent write corruption.
 fn append_to_spool(dir: &Path, events: &[Json], cap_bytes: u64) -> Result<()> {
     fs::create_dir_all(dir).ok();
-    let file = dir.join("events.jsonl");
+    let file_path = dir.join("events.jsonl");
 
-    let mut f = OpenOptions::new().create(true).append(true).open(&file)?;
+    // Open file and acquire exclusive lock
+    let mut f = OpenOptions::new().create(true).append(true).open(&file_path)?;
+    f.lock_exclusive()
+        .context("failed to acquire exclusive lock on spool file")?;
+
+    // Write events while holding lock
     for event in events {
         let line = serde_json::to_string(event)?;
         f.write_all(line.as_bytes())?;
         f.write_all(b"\n")?;
     }
+    f.flush()?;
+
+    // Check rotation before releasing lock to prevent race with flush_spool
+    let needs_rotation = file_path.metadata().map(|m| m.len()).unwrap_or(0) > cap_bytes;
+
+    // Release lock before rotation (rotation will acquire its own lock)
+    f.unlock().ok();
+    drop(f);
 
     // Rotate if file exceeds cap - keep last 50% of lines
-    if file.metadata().map(|m| m.len()).unwrap_or(0) > cap_bytes {
-        let tmp = dir.join("events.tmp");
-        fs::rename(&file, &tmp).ok();
-
-        let reader = BufReader::new(File::open(&tmp)?);
-        let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-        let keep_from = lines.len().saturating_sub(lines.len() / 2);
-        let keep = &lines[keep_from..];
-
-        let mut out = File::create(&file)?;
-        for line in keep {
-            writeln!(out, "{}", line)?;
-        }
-        let _ = fs::remove_file(tmp);
+    if needs_rotation {
+        rotate_spool_file(dir, &file_path)?;
     }
+
+    Ok(())
+}
+
+/// Rotate spool file by keeping last 50% of lines.
+///
+/// Uses exclusive lock during rotation to prevent concurrent access.
+fn rotate_spool_file(dir: &Path, file_path: &Path) -> Result<()> {
+    let tmp = dir.join("events.tmp");
+
+    // Acquire lock for rotation
+    let lock_file = OpenOptions::new().write(true).open(file_path)?;
+    lock_file.lock_exclusive()
+        .context("failed to acquire lock for rotation")?;
+
+    // Perform rotation
+    fs::rename(file_path, &tmp).ok();
+
+    let reader = BufReader::new(File::open(&tmp)?);
+    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+    let keep_from = lines.len().saturating_sub(lines.len() / 2);
+    let keep = &lines[keep_from..];
+
+    let mut out = File::create(file_path)?;
+    for line in keep {
+        writeln!(out, "{}", line)?;
+    }
+    out.flush()?;
+
+    // Release lock and cleanup
+    lock_file.unlock().ok();
+    drop(lock_file);
+    let _ = fs::remove_file(tmp);
 
     Ok(())
 }
@@ -425,6 +462,8 @@ fn append_to_spool(dir: &Path, events: &[Json], cap_bytes: u64) -> Result<()> {
 ///
 /// Sends in batches of 500. Clears spool only after all events successfully send.
 ///
+/// Uses exclusive file locking to prevent concurrent modification during flush.
+///
 /// # Errors
 ///
 /// Returns error on first send failure.
@@ -434,12 +473,21 @@ fn flush_spool(
     api_key: Option<&str>,
     dir: &Path,
 ) -> Result<()> {
-    let file = dir.join("events.jsonl");
-    if !file.exists() {
+    let file_path = dir.join("events.jsonl");
+    if !file_path.exists() {
         return Ok(());
     }
 
-    let reader = BufReader::new(File::open(&file)?);
+    // Acquire exclusive lock before reading
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file_path)?;
+    lock_file.lock_exclusive()
+        .context("failed to acquire exclusive lock for flush")?;
+
+    // Read and send events while holding lock
+    let reader = BufReader::new(File::open(&file_path)?);
     let mut batch: Vec<Json> = Vec::new();
 
     for line in reader.lines().map_while(Result::ok) {
@@ -457,7 +505,11 @@ fn flush_spool(
     }
 
     // Clear spool file only after all events successfully sent
-    File::create(&file)?;
+    File::create(&file_path)?;
+
+    // Release lock
+    lock_file.unlock().ok();
+
     Ok(())
 }
 
@@ -472,4 +524,270 @@ fn append_to_quarantine(dir: &Path, raw_line: &str, reason: String) -> Result<()
     let rec = serde_json::json!({ "reason": reason, "raw": raw_line });
     writeln!(f, "{}", rec)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+    use tempfile::TempDir;
+
+    /// Helper to create test events
+    fn test_event(id: usize) -> Json {
+        serde_json::json!({
+            "event": "test",
+            "id": id,
+            "timestamp": "2025-11-13T00:00:00Z"
+        })
+    }
+
+    /// Helper to read events from spool file
+    fn read_spool_events(dir: &Path) -> Vec<String> {
+        let file = dir.join("events.jsonl");
+        if !file.exists() {
+            return Vec::new();
+        }
+        std::fs::read_to_string(file)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn test_append_to_spool_basic() {
+        let temp_dir = TempDir::new().unwrap();
+        let events = vec![test_event(1), test_event(2), test_event(3)];
+
+        let result = append_to_spool(temp_dir.path(), &events, 1_000_000);
+        assert!(result.is_ok());
+
+        let lines = read_spool_events(temp_dir.path());
+        assert_eq!(lines.len(), 3);
+
+        // Verify each line is valid JSON
+        for line in &lines {
+            let parsed: Result<Json, _> = serde_json::from_str(line);
+            assert!(parsed.is_ok(), "Failed to parse: {}", line);
+        }
+    }
+
+    #[test]
+    fn test_append_to_spool_rotation_keeps_last_50_percent() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create 20 small events
+        let events: Vec<Json> = (0..20).map(test_event).collect();
+
+        // Set cap to trigger rotation after ~10 events (each event is ~60-70 bytes)
+        let cap_bytes = 700;
+
+        // First append: 10 events (~600 bytes, below cap)
+        append_to_spool(temp_dir.path(), &events[0..10], cap_bytes).unwrap();
+        let lines_after_first = read_spool_events(temp_dir.path());
+        println!("After first append: {} events", lines_after_first.len());
+
+        // Second append: 10 more events (total ~1200 bytes, exceeds cap)
+        append_to_spool(temp_dir.path(), &events[10..20], cap_bytes).unwrap();
+
+        // After rotation, should keep approximately last 50% of lines
+        let final_lines = read_spool_events(temp_dir.path());
+        println!("After rotation: {} events", final_lines.len());
+
+        // With 20 events total and rotation at 700 bytes, we should have
+        // kept the last 50% (approximately 10 events)
+        assert!(
+            final_lines.len() >= 8 && final_lines.len() <= 12,
+            "Expected ~10 events (50%) after rotation, got {}",
+            final_lines.len()
+        );
+
+        // Verify the kept events are the most recent ones (higher IDs)
+        let kept_ids: Vec<i64> = final_lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Json>(line).ok())
+            .filter_map(|event| event.get("id").and_then(|v| v.as_i64()))
+            .collect();
+
+        // Should have events from the second half (IDs >= 10)
+        assert!(
+            kept_ids.iter().any(|&id| id >= 10),
+            "Should have kept some events from second append"
+        );
+    }
+
+    #[test]
+    fn test_append_to_spool_concurrent_writes_no_corruption() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = Arc::new(temp_dir.path().to_path_buf());
+        let cap_bytes = 1_000_000; // Large cap to avoid rotation
+
+        // Spawn 10 threads, each writing 10 events concurrently
+        let handles: Vec<_> = (0..10)
+            .map(|thread_id| {
+                let dir = Arc::clone(&dir);
+                thread::spawn(move || {
+                    let events: Vec<Json> = (0..10)
+                        .map(|i| {
+                            serde_json::json!({
+                                "thread": thread_id,
+                                "event_id": i,
+                                "timestamp": "2025-11-13T00:00:00Z"
+                            })
+                        })
+                        .collect();
+
+                    append_to_spool(&dir, &events, cap_bytes).expect("append failed");
+                })
+            })
+            .collect();
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().expect("thread panicked");
+        }
+
+        // Verify all 100 events were written (10 threads × 10 events)
+        let lines = read_spool_events(&dir);
+        assert_eq!(lines.len(), 100, "Expected 100 events, got {}", lines.len());
+
+        // Verify each line is valid JSON (no corruption)
+        for (i, line) in lines.iter().enumerate() {
+            let parsed: Result<Json, _> = serde_json::from_str(line);
+            assert!(
+                parsed.is_ok(),
+                "Line {} corrupted or invalid JSON: {}",
+                i,
+                line
+            );
+        }
+
+        // Verify we have events from all 10 threads
+        let thread_ids: std::collections::HashSet<i64> = lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Json>(line).ok())
+            .filter_map(|event| event.get("thread").and_then(|v| v.as_i64()))
+            .collect();
+
+        assert_eq!(
+            thread_ids.len(),
+            10,
+            "Expected events from 10 threads, got {}",
+            thread_ids.len()
+        );
+    }
+
+    #[test]
+    fn test_flush_spool_clears_file_on_success() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Write some events to spool
+        let events = vec![test_event(1), test_event(2), test_event(3)];
+        append_to_spool(temp_dir.path(), &events, 1_000_000).unwrap();
+
+        // Verify events exist
+        assert_eq!(read_spool_events(temp_dir.path()).len(), 3);
+
+        // Create mock HTTP server that always returns 200
+        let mut mock_server = mockito::Server::new();
+        let mock = mock_server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"status":"ok"}"#)
+            .create();
+
+        // Flush spool
+        let client = http_client().unwrap();
+        let result = flush_spool(&client, &mock_server.url(), None, temp_dir.path());
+
+        assert!(result.is_ok(), "flush_spool failed: {:?}", result.err());
+
+        // Verify spool file is empty after successful flush
+        let lines_after = read_spool_events(temp_dir.path());
+        assert_eq!(
+            lines_after.len(),
+            0,
+            "Spool should be empty after successful flush"
+        );
+
+        // Verify HTTP request was made
+        mock.assert();
+    }
+
+    #[test]
+    fn test_flush_spool_batches_of_500() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Write 1200 events to trigger multiple batches
+        let events: Vec<Json> = (0..1200).map(test_event).collect();
+        append_to_spool(temp_dir.path(), &events, 10_000_000).unwrap();
+
+        // Create mock server that counts requests
+        let mut mock_server = mockito::Server::new();
+        let mock = mock_server
+            .mock("POST", "/")
+            .with_status(200)
+            .expect(3) // Should be 3 batches: 500 + 500 + 200
+            .create();
+
+        // Flush spool
+        let client = http_client().unwrap();
+        let result = flush_spool(&client, &mock_server.url(), None, temp_dir.path());
+
+        assert!(result.is_ok());
+
+        // Verify all 3 requests were made
+        mock.assert();
+    }
+
+    #[test]
+    fn test_jitter_range() {
+        let base = Duration::from_millis(200);
+
+        // Test jitter 100 times to verify range
+        for _ in 0..100 {
+            let jittered = jitter(base);
+            let ms = jittered.as_millis();
+
+            // Jitter should be ±50%: 100ms to 300ms
+            assert!(
+                ms >= 100 && ms <= 300,
+                "Jittered delay {}ms out of expected range [100, 300]",
+                ms
+            );
+        }
+    }
+
+    #[test]
+    fn test_append_to_quarantine() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let result = append_to_quarantine(
+            temp_dir.path(),
+            r#"{invalid json}"#,
+            "parse error".to_string(),
+        );
+
+        assert!(result.is_ok());
+
+        // Read quarantine file
+        let quarantine_file = temp_dir.path().join("quarantine.jsonl");
+        let content = std::fs::read_to_string(quarantine_file).unwrap();
+
+        // Verify format
+        let entry: Json = serde_json::from_str(&content.trim()).unwrap();
+        assert_eq!(entry["reason"], "parse error");
+        assert_eq!(entry["raw"], "{invalid json}");
+    }
+
+    #[test]
+    fn test_default_spool_dir_returns_valid_path() {
+        let result = default_spool_dir();
+        assert!(result.is_ok());
+
+        let path = result.unwrap();
+        assert!(path.to_string_lossy().contains("talon"));
+        assert!(path.to_string_lossy().contains("spool"));
+    }
 }

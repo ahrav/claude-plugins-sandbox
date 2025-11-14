@@ -43,8 +43,8 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 # Random jitter (for agent)
 rand = "0.9"
 
-# Directory resolution (for agent)
-dirs = "6.0"
+# Directory resolution (for agent) - maintained fork of dirs
+dirs-next = "2.0"
 
 # System info (for tap)
 whoami = "1.6"

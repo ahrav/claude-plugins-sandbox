@@ -35,6 +35,42 @@ struct Config {
     spool_bytes: u64,
 }
 
+/// RAII guard for spool directory lock.
+///
+/// Automatically releases the lock on drop, preventing lock leaks
+/// and ensuring proper cleanup on panic or early return.
+struct SpoolLockGuard {
+    _file: File,
+}
+
+impl SpoolLockGuard {
+    /// Acquire exclusive lock on the spool directory.
+    ///
+    /// Creates the lock file if it doesn't exist and blocks until
+    /// the lock is acquired.
+    fn acquire(dir: &Path) -> Result<Self> {
+        let lock_path = dir.join(".spool.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .context("failed to open spool lock file")?;
+
+        file.lock_exclusive()
+            .context("failed to acquire spool directory lock")?;
+
+        Ok(Self { _file: file })
+    }
+}
+
+impl Drop for SpoolLockGuard {
+    fn drop(&mut self) {
+        // Unlock is automatic when the file descriptor closes,
+        // but we can explicitly unlock for clarity
+        let _ = self._file.unlock();
+    }
+}
+
 #[derive(Parser)]
 #[command(author, version, about = "Talon observability agent")]
 struct Cli {
@@ -390,68 +426,95 @@ fn default_spool_dir() -> Result<PathBuf> {
 /// When file exceeds `cap_bytes`, keeps last 50% of lines (drops oldest) to bound
 /// disk usage while preserving recent events.
 ///
-/// Uses exclusive file locking to prevent concurrent write corruption.
+/// Uses directory-level locking to prevent race conditions during rotation.
+/// Calls `sync_all()` to ensure durability on crash.
 fn append_to_spool(dir: &Path, events: &[Json], cap_bytes: u64) -> Result<()> {
-    fs::create_dir_all(dir).ok();
+    fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create spool directory: {}", dir.display()))?;
     let file_path = dir.join("events.jsonl");
 
-    // Open file and acquire exclusive lock
-    let mut f = OpenOptions::new().create(true).append(true).open(&file_path)?;
-    f.lock_exclusive()
-        .context("failed to acquire exclusive lock on spool file")?;
+    // Acquire directory-level lock via RAII guard
+    let _lock = SpoolLockGuard::acquire(dir)?;
 
-    // Write events while holding lock
+    // Open file and write events while holding directory lock
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file_path)?;
+
     for event in events {
         let line = serde_json::to_string(event)?;
         f.write_all(line.as_bytes())?;
         f.write_all(b"\n")?;
     }
-    f.flush()?;
 
-    // Check rotation before releasing lock to prevent race with flush_spool
-    let needs_rotation = file_path.metadata().map(|m| m.len()).unwrap_or(0) > cap_bytes;
-
-    // Release lock before rotation (rotation will acquire its own lock)
-    f.unlock().ok();
+    // Ensure data is written to disk for crash safety
+    f.sync_all()
+        .context("failed to sync spool file to disk")?;
     drop(f);
 
-    // Rotate if file exceeds cap - keep last 50% of lines
+    // Check rotation while still holding directory lock
+    let needs_rotation = file_path
+        .metadata()
+        .map(|m| m.len())
+        .unwrap_or(0)
+        > cap_bytes;
+
+    // Rotate if needed while holding directory lock
+    // This prevents another thread from creating a new file during rotation
     if needs_rotation {
         rotate_spool_file(dir, &file_path)?;
     }
 
+    // Lock automatically released when _lock goes out of scope
     Ok(())
 }
 
 /// Rotate spool file by keeping last 50% of lines.
 ///
-/// Uses exclusive lock during rotation to prevent concurrent access.
+/// MUST be called while holding the directory lock (from append_to_spool).
+/// Does NOT acquire its own lock - relies on caller's directory lock.
+/// Syncs both file data and directory metadata for crash safety.
 fn rotate_spool_file(dir: &Path, file_path: &Path) -> Result<()> {
     let tmp = dir.join("events.tmp");
 
-    // Acquire lock for rotation
-    let lock_file = OpenOptions::new().write(true).open(file_path)?;
-    lock_file.lock_exclusive()
-        .context("failed to acquire lock for rotation")?;
+    // Perform rotation (caller holds directory lock)
+    fs::rename(file_path, &tmp)
+        .context("failed to rename spool file for rotation")?;
 
-    // Perform rotation
-    fs::rename(file_path, &tmp).ok();
+    // TESTING: Add artificial delay to widen race window for test verification
+    #[cfg(test)]
+    thread::sleep(Duration::from_millis(5));
 
+    // Read and keep last 50% of lines
     let reader = BufReader::new(File::open(&tmp)?);
     let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
     let keep_from = lines.len().saturating_sub(lines.len() / 2);
     let keep = &lines[keep_from..];
 
+    // Write kept lines to new file
     let mut out = File::create(file_path)?;
     for line in keep {
         writeln!(out, "{}", line)?;
     }
-    out.flush()?;
 
-    // Release lock and cleanup
-    lock_file.unlock().ok();
-    drop(lock_file);
-    let _ = fs::remove_file(tmp);
+    // Ensure file data is durable before cleaning up temp file
+    out.sync_all()
+        .context("failed to sync rotated spool file to disk")?;
+    drop(out);
+
+    // Sync directory to persist the rename operation
+    #[cfg(unix)]
+    {
+        let dir_fd = File::open(dir)?;
+        dir_fd
+            .sync_all()
+            .context("failed to sync directory metadata")?;
+    }
+
+    // Cleanup temp file
+    fs::remove_file(&tmp)
+        .with_context(|| format!("failed to remove temp file: {}", tmp.display()))?;
 
     Ok(())
 }
@@ -462,7 +525,8 @@ fn rotate_spool_file(dir: &Path, file_path: &Path) -> Result<()> {
 ///
 /// Sends in batches of 500. Clears spool only after all events successfully send.
 ///
-/// Uses exclusive file locking to prevent concurrent modification during flush.
+/// Uses directory-level locking to prevent concurrent modification during flush.
+/// Syncs after clearing to ensure durability.
 ///
 /// # Errors
 ///
@@ -478,13 +542,8 @@ fn flush_spool(
         return Ok(());
     }
 
-    // Acquire exclusive lock before reading
-    let lock_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&file_path)?;
-    lock_file.lock_exclusive()
-        .context("failed to acquire exclusive lock for flush")?;
+    // Acquire directory-level lock via RAII guard
+    let _lock = SpoolLockGuard::acquire(dir)?;
 
     // Read and send events while holding lock
     let reader = BufReader::new(File::open(&file_path)?);
@@ -505,11 +564,15 @@ fn flush_spool(
     }
 
     // Clear spool file only after all events successfully sent
-    File::create(&file_path)?;
+    let cleared = File::create(&file_path)
+        .context("failed to clear spool file after successful flush")?;
 
-    // Release lock
-    lock_file.unlock().ok();
+    // Ensure the truncation is durable
+    cleared
+        .sync_all()
+        .context("failed to sync cleared spool file")?;
 
+    // Lock automatically released when _lock goes out of scope
     Ok(())
 }
 
@@ -789,5 +852,230 @@ mod tests {
         let path = result.unwrap();
         assert!(path.to_string_lossy().contains("talon"));
         assert!(path.to_string_lossy().contains("spool"));
+    }
+
+    /// Test that concurrent appends during rotation do NOT lose data.
+    ///
+    /// Verifies the fix for the race condition where:
+    /// 1. Thread A renames events.jsonl -> events.tmp (lock released on renamed file)
+    /// 2. Thread B creates NEW events.jsonl and appends data
+    /// 3. Thread A does File::create() which truncates Thread B's data
+    #[test]
+    fn test_rotation_does_not_lose_concurrent_appends() {
+        use std::sync::{Arc, Barrier};
+
+        // Run test multiple times since race conditions can be timing-dependent
+        for _ in 0..20 {
+            let temp_dir = TempDir::new().unwrap();
+            let dir = Arc::new(temp_dir.path().to_path_buf());
+            let file_path = dir.join("events.jsonl");
+
+            // Create initial file
+            let initial_events: Vec<Json> = (0..1000).map(test_event).collect();
+            append_to_spool(&dir, &initial_events, 1_000_000).unwrap();
+
+            // Synchronize threads to maximize chance of hitting race window
+            let barrier = Arc::new(Barrier::new(2));
+            let barrier_clone = Arc::clone(&barrier);
+            let dir_clone = Arc::clone(&dir);
+            let file_path_clone = file_path.clone();
+
+            // Thread 1: Perform rotation
+            let rotation_handle = thread::spawn(move || {
+                barrier_clone.wait();
+
+                // Acquire directory lock via RAII guard
+                let _lock = SpoolLockGuard::acquire(&dir_clone).unwrap();
+
+                // Call rotate_spool_file while holding lock
+                rotate_spool_file(&dir_clone, &file_path_clone).unwrap();
+
+                // Lock automatically released when _lock goes out of scope
+            });
+
+            // Thread 2: Append during rotation window
+            let dir_clone2 = Arc::clone(&dir);
+            let append_handle = thread::spawn(move || {
+                barrier.wait();
+                thread::sleep(Duration::from_millis(2));
+
+                // Append critical events that should NOT be lost
+                let critical_events: Vec<Json> = (9000..9010)
+                    .map(|i| {
+                        serde_json::json!({
+                            "event": "CRITICAL",
+                            "id": i,
+                            "timestamp": "2025-11-14T00:00:00Z"
+                        })
+                    })
+                    .collect();
+
+                append_to_spool(&dir_clone2, &critical_events, 1_000_000).unwrap();
+            });
+
+            rotation_handle.join().unwrap();
+            append_handle.join().unwrap();
+
+            // Verify all critical events were preserved
+            let final_lines = read_spool_events(&dir);
+            let critical_count = final_lines
+                .iter()
+                .filter_map(|line| serde_json::from_str::<Json>(line).ok())
+                .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("CRITICAL"))
+                .count();
+
+            assert_eq!(
+                critical_count, 10,
+                "Data loss during rotation: expected 10 critical events, found {}",
+                critical_count
+            );
+        }
+    }
+
+    /// Test that file locking works correctly across separate processes.
+    ///
+    /// Verifies that the spool directory lock prevents data corruption when
+    /// accessed from multiple processes (not just threads). This test:
+    /// 1. Creates a temp directory with test events
+    /// 2. Spawns a child process running `talon-agent flush`
+    /// 3. Concurrently appends events from the parent process
+    /// 4. Verifies no data corruption or lock failures occur
+    #[test]
+    #[cfg(unix)]
+    fn test_cross_process_locking() {
+        use std::env;
+        use std::process::Command;
+
+        let temp_dir = TempDir::new().unwrap();
+        let spool_path = temp_dir.path();
+
+        // Write initial events to spool
+        let initial_events: Vec<Json> = (0..50).map(test_event).collect();
+        append_to_spool(spool_path, &initial_events, 1_000_000).unwrap();
+
+        // Verify initial state
+        let lines_before = read_spool_events(spool_path);
+        assert_eq!(lines_before.len(), 50, "Initial events not written correctly");
+
+        // Create mock HTTP server for flush to succeed
+        let mut mock_server = mockito::Server::new();
+        let mock = mock_server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"status":"ok"}"#)
+            .expect_at_least(1)
+            .create();
+
+        // Get the path to the test binary
+        let test_exe = env::current_exe().unwrap();
+        let exe_dir = test_exe.parent().unwrap();
+
+        // Find talon-agent binary - it should be in the same directory as the test
+        // or in ../../ (deps -> debug/release)
+        let agent_path = if exe_dir.join("talon-agent").exists() {
+            exe_dir.join("talon-agent")
+        } else {
+            exe_dir.parent().unwrap().join("talon-agent")
+        };
+
+        // Spawn child process running `talon-agent flush` while parent holds operations
+        let spool_dir_str = spool_path.to_str().unwrap();
+        let endpoint = mock_server.url();
+
+        // Start parent append in background thread that will try to acquire lock
+        let spool_path_clone = spool_path.to_path_buf();
+        let append_handle = thread::spawn(move || {
+            // Small delay to let child process start first
+            thread::sleep(Duration::from_millis(10));
+
+            // Try to append new events while child is flushing
+            // This should block until child releases lock, then succeed
+            let parent_events: Vec<Json> = (1000..1020)
+                .map(|i| {
+                    serde_json::json!({
+                        "event": "parent_process",
+                        "id": i,
+                        "timestamp": "2025-11-14T00:00:00Z"
+                    })
+                })
+                .collect();
+
+            append_to_spool(&spool_path_clone, &parent_events, 1_000_000)
+        });
+
+        // Start child process - it will try to acquire lock
+        let mut child = Command::new(&agent_path)
+            .arg("flush")
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .arg("--spool-dir")
+            .arg(spool_dir_str)
+            .spawn()
+            .expect("Failed to spawn talon-agent flush process");
+
+        // Wait for child process to complete
+        let status = child.wait().expect("Failed to wait for child process");
+
+        // Wait for parent append to complete
+        let append_result = append_handle.join().expect("Parent thread panicked");
+
+        // Verify both processes completed successfully
+        assert!(status.success(), "Child process failed with status: {}", status);
+        assert!(append_result.is_ok(), "Parent append failed: {:?}", append_result.err());
+
+        // Verify final state: spool should contain parent's events
+        // (child may have flushed the initial events, or they may all still be there)
+        let final_lines = read_spool_events(spool_path);
+
+        // Count parent events - these should ALWAYS be present
+        let parent_count = final_lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Json>(line).ok())
+            .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("parent_process"))
+            .count();
+
+        // Parent events should be present regardless of race outcome
+        assert_eq!(
+            parent_count, 20,
+            "Expected 20 parent events, found {}. Final lines: {}",
+            parent_count,
+            final_lines.len()
+        );
+
+        // Verify no corruption: all lines should be valid JSON
+        for (i, line) in final_lines.iter().enumerate() {
+            let parsed: Result<Json, _> = serde_json::from_str(line);
+            assert!(
+                parsed.is_ok(),
+                "Line {} corrupted or invalid JSON: {}",
+                i,
+                line
+            );
+        }
+
+        // Count initial events that might remain if parent appended before child flushed
+        let initial_count = final_lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Json>(line).ok())
+            .filter(|e| {
+                e.get("event").and_then(|v| v.as_str()) == Some("test")
+                    && e.get("id").and_then(|v| v.as_i64()).map(|id| id < 50).unwrap_or(false)
+            })
+            .count();
+
+        // Total events should be either:
+        // - 20 (parent only, child flushed first) OR
+        // - 70 (parent + initial, parent appended before child flushed)
+        let total = final_lines.len();
+        assert!(
+            total == 20 || total == 70,
+            "Expected either 20 or 70 total events, found {}. Parent: {}, Initial: {}",
+            total,
+            parent_count,
+            initial_count
+        );
+
+        // Verify HTTP mock was called (flush succeeded)
+        mock.assert();
     }
 }

@@ -415,7 +415,7 @@ fn jitter(d: Duration) -> Duration {
 
 /// Get default spool directory.
 fn default_spool_dir() -> Result<PathBuf> {
-    let base = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir);
+    let base = dirs_next::data_local_dir().unwrap_or_else(std::env::temp_dir);
     Ok(base.join("talon").join("spool"))
 }
 

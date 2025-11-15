@@ -296,14 +296,12 @@ pub fn from_tap_frame(v: Json) -> Result<TraceV1> {
 
     t.configuration.top_k = payload
         .get("top_k")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as u32)
+        .map(|v| as_u32_sat(v))
         .unwrap_or(0);
 
     t.configuration.max_tokens = payload
         .get("max_tokens")
-        .and_then(|v| v.as_i64())
-        .map(|v| v as u32)
+        .map(|v| as_u32_sat(v))
         .unwrap_or(0);
 
     // Extract tool usage details.

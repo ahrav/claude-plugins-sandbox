@@ -218,12 +218,16 @@ pub fn from_tap_frame(v: Json) -> Result<TraceV1> {
     // Clone raw payload before enrichment for audit trail
     let raw_payload_for_audit = payload.clone();
 
-    // Enrich from transcript if path is present
-    if let Some(transcript_path) = payload.get("transcript_path").and_then(|p| p.as_str())
-        && let Some(latest_msg) = read_latest_assistant_message(transcript_path)
-    {
-        enrich_from_transcript(&mut payload, &latest_msg);
-    }
+    // Enrich from transcript if path is present and store latest message for conversation_id extraction
+    let latest_msg = if let Some(transcript_path) = payload.get("transcript_path").and_then(|p| p.as_str()) {
+        let msg = read_latest_assistant_message(transcript_path);
+        if let Some(ref m) = msg {
+            enrich_from_transcript(&mut payload, m);
+        }
+        msg
+    } else {
+        None
+    };
 
     // Set timestamp with cascading fallback: tap frame ts → enriched payload → empty
     let timestamp = if !ts.is_empty() {
@@ -261,19 +265,44 @@ pub fn from_tap_frame(v: Json) -> Result<TraceV1> {
         t.ids.session_id = sid.to_string();
     }
 
+    // Extract conversation_id from transcript message.id (maps to Claude's message ID)
+    if let Some(ref msg) = latest_msg {
+        t.ids.conversation_id = msg
+            .get("message")
+            .and_then(|m| m.get("id"))
+            .and_then(|id| id.as_str())
+            .unwrap_or("")
+            .to_string();
+    }
+
     // Extract model configuration.
     if let Some(m) = payload.get("model").and_then(|x| x.as_str()) {
         t.configuration.model = m.to_string();
     }
-    if let Some(temp) = payload.get("temperature").and_then(|x| x.as_f64()) {
-        t.configuration.temperature = temp as f32;
-    }
-    if let Some(tp) = payload.get("top_p").and_then(|x| x.as_f64()) {
-        t.configuration.top_p = tp as f32;
-    }
-    if let Some(mt) = payload.get("max_tokens") {
-        t.configuration.max_tokens = as_u32_sat(mt);
-    }
+
+    // Extract parameters from payload only.
+    // If a parameter isn't captured, we leave it as 0 to indicate missing data.
+    t.configuration.temperature = payload
+        .get("temperature")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(0.0);
+
+    t.configuration.top_p = payload
+        .get("top_p")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(0.0);
+
+    t.configuration.top_k = payload
+        .get("top_k")
+        .map(|v| as_u32_sat(v))
+        .unwrap_or(0);
+
+    t.configuration.max_tokens = payload
+        .get("max_tokens")
+        .map(|v| as_u32_sat(v))
+        .unwrap_or(0);
 
     // Extract tool usage details.
     if let Some(name) = payload.get("tool_name").and_then(|x| x.as_str()) {
@@ -294,15 +323,27 @@ pub fn from_tap_frame(v: Json) -> Result<TraceV1> {
         t.outputs.finish_reason = fr.to_string();
     }
 
-    // Extract usage metrics.
+    // Extract usage metrics into both metrics and outputs (for Beak compatibility).
     if let Some(u) = payload.get("usage") {
-        t.metrics.prompt_tokens = u.get("prompt_tokens").map(as_u32_sat).unwrap_or(0);
-        t.metrics.completion_tokens = u.get("completion_tokens").map(as_u32_sat).unwrap_or(0);
-        t.metrics.total_tokens = u.get("total_tokens").map(as_u32_sat).unwrap_or(0);
-        t.metrics.token_counts_estimated = u
+        let prompt_tokens = u.get("prompt_tokens").map(as_u32_sat).unwrap_or(0);
+        let completion_tokens = u.get("completion_tokens").map(as_u32_sat).unwrap_or(0);
+        let total_tokens = u.get("total_tokens").map(as_u32_sat).unwrap_or(0);
+        let tokens_estimated = u
             .get("token_counts_estimated")
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
+
+        // Populate metrics object (existing behavior)
+        t.metrics.prompt_tokens = prompt_tokens;
+        t.metrics.completion_tokens = completion_tokens;
+        t.metrics.total_tokens = total_tokens;
+        t.metrics.token_counts_estimated = tokens_estimated;
+
+        // Also populate outputs object for Beak compatibility
+        t.outputs.input_tokens = prompt_tokens;
+        t.outputs.output_tokens = completion_tokens;
+        t.outputs.total_tokens = total_tokens;
+        t.outputs.tokens_estimated = tokens_estimated;
     }
 
     // Extract latency metrics.
@@ -573,4 +614,56 @@ mod tests {
         assert_eq!(trace.metrics.total_tokens, 3650);
         assert_eq!(trace.outputs.finish_reason, "tool_use");
     }
+
+    #[test]
+    fn test_token_duplication_in_outputs() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create transcript file with usage data
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"id":"msg_abc123","model":"claude-sonnet-4-5-20250929","usage":{{"input_tokens":1000,"cache_creation_input_tokens":500,"cache_read_input_tokens":2000,"output_tokens":150}},"stop_reason":"end_turn"}},"timestamp":"2025-11-14T05:12:50.346Z"}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        // Create tap frame with transcript_path
+        let frame = serde_json::json!({
+            "event": "model.end",
+            "ts": "2025-11-13T10:30:00Z",
+            "env": {
+                "host": "test-host",
+                "pid": 1234,
+                "session_id": "test-session"
+            },
+            "payload": {
+                "transcript_path": file.path().to_str().unwrap()
+            },
+            "plugin": "talon",
+            "version": "0.1.0"
+        });
+
+        let result = from_tap_frame(frame);
+        assert!(result.is_ok(), "from_tap_frame should succeed");
+
+        let trace = result.unwrap();
+
+        // Verify tokens are in metrics object (existing behavior)
+        assert_eq!(trace.metrics.prompt_tokens, 3500); // 1000+500+2000
+        assert_eq!(trace.metrics.completion_tokens, 150);
+        assert_eq!(trace.metrics.total_tokens, 3650);
+        assert_eq!(trace.metrics.token_counts_estimated, false);
+
+        // Verify tokens are ALSO in outputs object (new behavior for Beak compatibility)
+        assert_eq!(trace.outputs.input_tokens, 3500);
+        assert_eq!(trace.outputs.output_tokens, 150);
+        assert_eq!(trace.outputs.total_tokens, 3650);
+        assert_eq!(trace.outputs.tokens_estimated, false);
+
+        // Verify conversation_id is extracted from message.id
+        assert_eq!(trace.ids.conversation_id, "msg_abc123");
+    }
+
 }

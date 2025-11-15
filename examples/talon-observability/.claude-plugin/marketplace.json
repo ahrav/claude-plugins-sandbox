@@ -1,0 +1,7 @@
+{
+  "name": "Talon Observability Plugin",
+  "version": "0.1.0",
+  "description": "Captures Claude Code tool calls and stop events, forwarding them to talon-agent for observability and tracing",
+  "author": "Talon Team",
+  "hooks": "../hooks/hooks.json"
+}

@@ -196,6 +196,22 @@ pub struct Outputs {
     /// Whether the output was truncated due to length limits.
     #[serde(default)]
     pub truncated: bool,
+
+    /// Number of tokens in the input/prompt (duplicated from metrics for Beak compatibility).
+    #[serde(default)]
+    pub input_tokens: u32,
+
+    /// Number of tokens in the completion/output (duplicated from metrics for Beak compatibility).
+    #[serde(default)]
+    pub output_tokens: u32,
+
+    /// Total tokens consumed (duplicated from metrics for Beak compatibility).
+    #[serde(default)]
+    pub total_tokens: u32,
+
+    /// Whether token counts are estimated (duplicated from metrics for Beak compatibility).
+    #[serde(default)]
+    pub tokens_estimated: bool,
 }
 
 /// Performance and cost metrics.

@@ -113,16 +113,13 @@ talon-tap --event "tool-call" < /dev/stdin
 
 ### Event Format
 
-Events sent to the collector:
+**Tap envelope** (sent via IPC from talon-tap to talon-agent):
 
 ```json
 {
   "event": "tool-call",
   "payload": { /* original hook JSON */ },
   "ts": "2025-01-13T12:34:56.789Z",
-  "timestamp": "2025-01-13T12:34:56.789Z",
-  "trace_id": "550e8400-e29b-41d4-a716-446655440000",
-  "span_id": "660e8400-e29b-41d4-a716-446655440000",
   "env": {
     "session_id": "abc123",
     "host": "my-machine",
@@ -132,6 +129,8 @@ Events sent to the collector:
   "version": "0.1.0"
 }
 ```
+
+**Note**: The agent transforms this to the canonical `beak.trace.v1` schema, adds trace/span IDs, then converts to Beak-compatible format before sending to the collector. See `schema.rs`, `map.rs`, and `beak_adapter.rs` for details.
 
 ## Design Decisions
 

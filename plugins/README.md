@@ -1,37 +1,27 @@
 # Claude Code Plugins
 
-This directory contains custom Claude Code plugins built as standalone Rust binaries.
+Custom Claude Code plugins built as standalone Rust binaries for observability and tooling integration.
 
-## Organization
+## Current Plugins
 
-Each plugin is organized as a subdirectory:
+### Talon (`talon/`)
+Observability system for capturing and forwarding Claude Code hook events to trace collectors.
 
-```
-plugins/
-├── README.md
-├── talon/          # Observability tap & agent
-└── [future]/       # Additional plugins go here
-```
+**Components:**
+- `talon-tap` - Lightweight hook forwarder (reads stdin, sends to agent via IPC)
+- `talon-agent` - Background daemon (batching, compression, HTTP delivery, disk spooling)
 
-## Plugin Structure
+**Use case:** Real-time trace collection with automatic retries and offline spooling.
 
-Plugins can use either:
-- **Single package** (shared dependencies, multiple binaries in `src/bin/`)
-- **Cargo workspace** (independent versioning, separate crates)
+## Quick Build
 
-The choice depends on whether the plugin's components benefit from shared dependencies and unified versioning.
-
-## Building Plugins
-
-To build a specific plugin:
-
+Build a specific plugin:
 ```bash
 cd plugins/talon
 cargo build --release
 ```
 
-To build all plugins:
-
+Build all plugins:
 ```bash
 # From repository root
 for plugin in plugins/*/Cargo.toml; do
@@ -39,6 +29,21 @@ for plugin in plugins/*/Cargo.toml; do
 done
 ```
 
-## Installing Plugins
+Binaries output to `target/release/` within each plugin directory.
 
-Built binaries are located in `target/release/` within each plugin directory. Install them to your PATH or reference them directly in Claude Code hooks configuration.
+## Plugin Organization
+
+Plugins can be structured as:
+- **Single package** - Multiple binaries in `src/bin/`, shared dependencies (e.g., talon)
+- **Cargo workspace** - Independent crates with separate versioning
+
+Choose based on whether components share dependencies and benefit from unified versioning.
+
+## Installation
+
+Add built binaries to your PATH or reference them directly in Claude Code hooks configuration.
+
+## Documentation
+
+- **Complete setup guide:** [../docs/SETUP.md](../docs/SETUP.md)
+- **Talon details:** [talon/README.md](./talon/README.md)

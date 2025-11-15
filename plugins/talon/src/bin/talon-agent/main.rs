@@ -3,9 +3,11 @@
 //! Accepts events from talon-tap via IPC, batches efficiently, and forwards
 //! to a trace collector with retry logic and disk spooling.
 
+mod beak_adapter;
 mod map;
 mod schema;
 
+use crate::beak_adapter::to_beak_format;
 use crate::map::from_tap_frame;
 use crate::schema::canonicalize;
 
@@ -366,8 +368,20 @@ fn send_batch(
         return Ok(());
     }
 
+    // Transform TraceV1 traces to Beak-compatible format.
+    // This moves token metrics from 'metrics' object to 'outputs' object
+    // and simplifies the structure to match Beak's expected schema.
+    let beak_traces: Vec<_> = events
+        .iter()
+        .filter_map(|event| {
+            // Deserialize Json back to TraceV1 for transformation
+            serde_json::from_value::<crate::schema::TraceV1>(event.clone()).ok()
+        })
+        .map(|trace| to_beak_format(&trace))
+        .collect();
+
     // Serialize and compress (typically 5-10x size reduction)
-    let body_json = serde_json::to_vec(events)?;
+    let body_json = serde_json::to_vec(&beak_traces)?;
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&body_json)?;
     let body_gz = encoder.finish()?;

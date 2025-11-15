@@ -223,8 +223,8 @@ $PROJECT_ROOT/plugins/talon/target/release/talon-agent
 ### Test 2: Manual Hook Test
 
 ```bash
-cd $MARKETPLACE_DIR/beak-tracer
-./test-hook.sh
+cd $PROJECT_ROOT/examples/talon-observability
+./test-plugin.sh
 ```
 
 ### Test 3: Test talon-tap
@@ -372,7 +372,7 @@ talon-agent flush --endpoint "$TRACE_ENDPOINT" --api-key "$TRACE_API_KEY"
 - [ ] Verify installation (`/plugin`)
 
 **Part 4: Test & Verify**
-- [ ] Run test script (`./test-hook.sh`)
+- [ ] Run test script (`./test-plugin.sh`)
 - [ ] Use Claude Code (run any command)
 - [ ] Check traces arriving at endpoint
 

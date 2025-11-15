@@ -103,4 +103,14 @@ Contributions welcome! To add new plugins or examples:
 
 ## License
 
-This project is licensed under the terms of the [MIT License](LICENSE).
+Licensed under either of
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project by you, as defined in the Apache
+License, shall be dual licensed as above, without any additional terms or
+conditions.

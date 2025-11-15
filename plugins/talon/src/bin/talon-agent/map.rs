@@ -10,88 +10,9 @@
 use crate::schema::*;
 use anyhow::{Result, anyhow};
 use serde_json::Value as Json;
-use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::OnceLock;
-
-/// Model defaults configuration structure.
-///
-/// Contains default parameters for known Claude models and a fallback for unknown models.
-#[derive(Debug, serde::Deserialize)]
-struct ModelDefaults {
-    models: HashMap<String, ModelParams>,
-    fallback: ModelParams,
-}
-
-/// Default model parameters.
-///
-/// These are applied when the API response doesn't include parameter values.
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ModelParams {
-    temperature: f32,
-    top_p: f32,
-    top_k: u32,
-    max_tokens: u32,
-}
-
-/// Global storage for model defaults, loaded once on first access.
-static MODEL_DEFAULTS: OnceLock<Option<ModelDefaults>> = OnceLock::new();
-
-/// Gets the cached model defaults, loading them on first access.
-///
-/// Returns a reference to the static Option<ModelDefaults>.
-fn get_defaults() -> &'static Option<ModelDefaults> {
-    MODEL_DEFAULTS.get_or_init(load_model_defaults)
-}
-
-/// Loads model defaults from configuration file.
-///
-/// Tries multiple relative paths to find the config file:
-/// - `model-defaults.json` (running from project root)
-/// - `../model-defaults.json` (running from plugins/talon/)
-/// - `../../model-defaults.json` (running from target/debug/)
-///
-/// Returns `None` if the file cannot be found or parsed.
-fn load_model_defaults() -> Option<ModelDefaults> {
-    let paths = vec![
-        "model-defaults.json",
-        "../model-defaults.json",
-        "../../model-defaults.json",
-        "plugins/talon/model-defaults.json",
-    ];
-
-    for path in paths {
-        if let Ok(content) = fs::read_to_string(path) {
-            match serde_json::from_str(&content) {
-                Ok(defaults) => {
-                    eprintln!("Loaded model defaults from: {}", path);
-                    return Some(defaults);
-                }
-                Err(e) => {
-                    eprintln!("Failed to parse model defaults from {}: {}", path, e);
-                }
-            }
-        }
-    }
-
-    eprintln!("Model defaults config not found, using fallback values");
-    None
-}
-
-/// Gets default parameters for a specific model.
-///
-/// Returns model-specific defaults if available, otherwise returns the fallback defaults.
-/// Returns `None` if the config file couldn't be loaded.
-fn get_model_params(defaults: &Option<ModelDefaults>, model: &str) -> Option<ModelParams> {
-    defaults.as_ref().and_then(|d| {
-        d.models
-            .get(model)
-            .cloned()
-            .or_else(|| Some(d.fallback.clone()))
-    })
-}
 
 /// Safely converts a JSON value to u32, saturating at u32::MAX if the value exceeds the limit.
 ///
@@ -359,39 +280,30 @@ pub fn from_tap_frame(v: Json) -> Result<TraceV1> {
         t.configuration.model = m.to_string();
     }
 
-    // Get model-specific defaults for parameter fallback
-    let model_name = t.configuration.model.as_str();
-    let defaults = get_defaults();
-    let model_params = get_model_params(defaults, model_name);
-
-    // Apply parameters with smart defaults based on model
-    // Fallback chain: payload → model defaults → 0
+    // Extract parameters from payload only.
+    // If a parameter isn't captured, we leave it as 0 to indicate missing data.
     t.configuration.temperature = payload
         .get("temperature")
         .and_then(|v| v.as_f64())
         .map(|v| v as f32)
-        .or_else(|| model_params.as_ref().map(|p| p.temperature))
         .unwrap_or(0.0);
 
     t.configuration.top_p = payload
         .get("top_p")
         .and_then(|v| v.as_f64())
         .map(|v| v as f32)
-        .or_else(|| model_params.as_ref().map(|p| p.top_p))
         .unwrap_or(0.0);
 
     t.configuration.top_k = payload
         .get("top_k")
         .and_then(|v| v.as_i64())
         .map(|v| v as u32)
-        .or_else(|| model_params.as_ref().map(|p| p.top_k))
         .unwrap_or(0);
 
     t.configuration.max_tokens = payload
         .get("max_tokens")
         .and_then(|v| v.as_i64())
         .map(|v| v as u32)
-        .or_else(|| model_params.as_ref().map(|p| p.max_tokens))
         .unwrap_or(0);
 
     // Extract tool usage details.
@@ -756,119 +668,4 @@ mod tests {
         assert_eq!(trace.ids.conversation_id, "msg_abc123");
     }
 
-    #[test]
-    fn test_model_defaults_applied() {
-        // Create a payload with model but no parameters
-        let frame = serde_json::json!({
-            "event": "tool.post",
-            "ts": "2025-11-14T10:00:00Z",
-            "env": {
-                "host": "test-host",
-                "pid": 5678,
-                "session_id": "test-session-123"
-            },
-            "payload": {
-                "model": "claude-sonnet-4-5-20250929",
-                "tool_name": "Read",
-                "tool_input": {"path": "/tmp/test.txt"}
-            },
-            "plugin": "talon",
-            "version": "0.1.0"
-        });
-
-        let result = from_tap_frame(frame);
-        assert!(result.is_ok(), "from_tap_frame should succeed");
-
-        let trace = result.unwrap();
-        assert_eq!(trace.configuration.model, "claude-sonnet-4-5-20250929");
-
-        // If defaults loaded, should apply model-specific values
-        // If not loaded, should fall back to 0 values
-        // Test verifies it doesn't crash and produces valid output
-        if trace.configuration.temperature > 0.0 {
-            // Defaults were loaded - verify they match expected values
-            assert_eq!(trace.configuration.temperature, 1.0);
-            assert_eq!(trace.configuration.top_p, 0.999);
-            assert_eq!(trace.configuration.top_k, 0);
-            assert_eq!(trace.configuration.max_tokens, 8192);
-        } else {
-            // Defaults not loaded - verify graceful fallback to 0
-            assert_eq!(trace.configuration.temperature, 0.0);
-            assert_eq!(trace.configuration.top_p, 0.0);
-            assert_eq!(trace.configuration.top_k, 0);
-            assert_eq!(trace.configuration.max_tokens, 0);
-        }
-    }
-
-    #[test]
-    fn test_payload_params_override_defaults() {
-        // Create a payload with explicit parameters
-        let frame = serde_json::json!({
-            "event": "tool.post",
-            "ts": "2025-11-14T10:00:00Z",
-            "env": {
-                "host": "test-host",
-                "pid": 5678,
-                "session_id": "test-session-123"
-            },
-            "payload": {
-                "model": "claude-sonnet-4-5-20250929",
-                "temperature": 0.5,
-                "top_p": 0.95,
-                "top_k": 50,
-                "max_tokens": 2048,
-                "tool_name": "Read"
-            },
-            "plugin": "talon",
-            "version": "0.1.0"
-        });
-
-        let result = from_tap_frame(frame);
-        assert!(result.is_ok(), "from_tap_frame should succeed");
-
-        let trace = result.unwrap();
-
-        // Explicit parameters should override defaults
-        assert_eq!(trace.configuration.temperature, 0.5);
-        assert_eq!(trace.configuration.top_p, 0.95);
-        assert_eq!(trace.configuration.top_k, 50);
-        assert_eq!(trace.configuration.max_tokens, 2048);
-    }
-
-    #[test]
-    fn test_unknown_model_uses_fallback_defaults() {
-        // Create a payload with an unknown model
-        let frame = serde_json::json!({
-            "event": "tool.post",
-            "ts": "2025-11-14T10:00:00Z",
-            "env": {
-                "host": "test-host",
-                "pid": 5678,
-                "session_id": "test-session-123"
-            },
-            "payload": {
-                "model": "unknown-model-xyz",
-                "tool_name": "Read"
-            },
-            "plugin": "talon",
-            "version": "0.1.0"
-        });
-
-        let result = from_tap_frame(frame);
-        assert!(result.is_ok(), "from_tap_frame should succeed");
-
-        let trace = result.unwrap();
-        assert_eq!(trace.configuration.model, "unknown-model-xyz");
-
-        // If defaults loaded, should apply fallback values
-        // If not loaded, should fall back to 0
-        // Test verifies it doesn't crash either way
-        if trace.configuration.temperature > 0.0 {
-            // Fallback defaults should be applied
-            assert_eq!(trace.configuration.temperature, 1.0);
-            assert_eq!(trace.configuration.top_p, 0.999);
-            assert_eq!(trace.configuration.top_k, 0);
-            assert_eq!(trace.configuration.max_tokens, 4096);
-        }
-    }
 }

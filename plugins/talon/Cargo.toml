@@ -49,6 +49,16 @@ dirs = "6.0"
 # System info (for tap)
 whoami = "1.6"
 
+# File locking (for agent)
+fs2 = "0.4"
+
+[dev-dependencies]
+# Testing frameworks
+tempfile = "3.8"              # Temporary files/directories
+mockito = "1.5"               # HTTP mocking
+serial_test = "3.0"           # Serialize env-modifying tests
+pretty_assertions = "1.4"     # Better assertion output
+
 [profile.release]
 lto = true
 codegen-units = 1
